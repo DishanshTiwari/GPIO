@@ -41,6 +41,7 @@
 
 // Helper to cast sockaddr_in* to sockaddr* safely (required by POSIX socket APIs)
 inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
+    // This reinterpret_cast is necessary due to POSIX API requirements.
     return reinterpret_cast<sockaddr*>(addr);
 }
 
@@ -108,6 +109,9 @@ public:
     }
 };
 
+/**
+ * @brief Accessor for singleton Logger instance.
+ */
 inline Logger& gLogger() {
     static Logger instance;
     return instance;
@@ -369,13 +373,16 @@ using plugin_create_t = IAlertPlugin* (*)();
 using plugin_destroy_t = void (*)(IAlertPlugin*);
 
 class PluginHandle {
-    void* handle_{nullptr};
-public:
-    explicit PluginHandle(void* handle = nullptr) noexcept : handle_(handle) {}
-    bool isValid() const noexcept { return handle_ != nullptr; }
-    void* get() const noexcept { return handle_; }
+private:
+    using SharedLibHandle = void*;
+    SharedLibHandle handle_{nullptr};
 
-    void close() {
+public:
+    explicit PluginHandle(SharedLibHandle handle = nullptr) noexcept : handle_(handle) {}
+    bool isValid() const noexcept { return handle_ != nullptr; }
+    SharedLibHandle get() const noexcept { return handle_; }
+
+    void close() noexcept {
         if (handle_) {
             dlclose(handle_);
             handle_ = nullptr;
@@ -397,7 +404,6 @@ public:
         }
         return *this;
     }
-
     ~PluginHandle() {
         close();
     }
@@ -432,7 +438,7 @@ public:
     }
 
     PluginManager& operator=(PluginManager&& other) noexcept {
-        if (this != &other) {
+        if(this != &other) {
             unload();
             handle_ = std::move(other.handle_);
             plugin_ = other.plugin_;
@@ -445,18 +451,15 @@ public:
 
     bool load(const std::string& path) {
         if (handle_.isValid()) return false;
-
         void* libHandle = dlopen(path.c_str(), RTLD_NOW);
         if (!libHandle) {
             util::gLogger().log(util::LogLevel::Error, "Failed to load plugin: ", dlerror());
             return false;
         }
         handle_ = PluginHandle(libHandle);
-
         try {
             auto create = get_symbol<plugin_create_t>(handle_, "create_plugin");
             destroy_ = get_symbol<plugin_destroy_t>(handle_, "destroy_plugin");
-
             plugin_ = create();
             plugin_->initialize();
             util::gLogger().log(util::LogLevel::Info, "Plugin loaded: ", path);
@@ -481,17 +484,12 @@ public:
         util::gLogger().log(util::LogLevel::Info, "Plugin unloaded");
     }
 
-    bool isLoaded() const noexcept {
-        return plugin_ != nullptr;
-    }
+    bool isLoaded() const noexcept { return plugin_ != nullptr; }
 
     void alert(std::string_view message) noexcept {
         if (plugin_) {
-            try {
-                plugin_->alert(message);
-            } catch (...) {
-                util::gLogger().log(util::LogLevel::Error, "Alert plugin threw exception");
-            }
+            try { plugin_->alert(message); }
+            catch (...) { util::gLogger().log(util::LogLevel::Error, "Alert plugin threw exception"); }
         }
     }
 
@@ -522,7 +520,7 @@ class HttpServer {
                 continue;
             }
             std::array<char, 1024> buf{};
-            ssize_t count = read(clientFd, buf.data(), static_cast<size_t>(buf.size() - 1));
+            ssize_t count = read(clientFd, buf.data(), buf.size() - 1);
             if (count <= 0) {
                 close(clientFd);
                 continue;
@@ -807,6 +805,7 @@ int main() {
 
     return 0;
 }
+
 
 
 
