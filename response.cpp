@@ -11,7 +11,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cctype>
 #include <exception>
 #include <fcntl.h>
@@ -21,7 +20,6 @@
 #include <map>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <random>
 #include <sstream>
 #include <string>
@@ -41,7 +39,7 @@
 #include <ctime>
 #include <type_traits>
 
-// Helper to cast sockaddr_in* to sockaddr* safely (POSIX API requirement)
+// Helper to cast sockaddr_in* to sockaddr* safely (required by POSIX socket APIs)
 inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
     return reinterpret_cast<sockaddr*>(addr);
 }
@@ -49,7 +47,7 @@ inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
 namespace util {
 
 /**
- * @brief Log levels used by Logger.
+ * @brief Log levels for logger.
  */
 enum class LogLevel : int {
     Error = 0,
@@ -60,14 +58,14 @@ enum class LogLevel : int {
 };
 
 /**
- * @brief Thread-safe logger with log level control and load-based skipping.
+ * @brief Thread-safe logger with level control and load-based skipping.
  */
 class Logger {
     std::mutex logMutex_;
     LogLevel level_{LogLevel::Info};
     std::atomic<bool> highLoad_{false};
 
-    static inline constexpr const char* ToString(LogLevel lvl) {
+    static constexpr const char* ToString(LogLevel lvl) {
         using enum LogLevel;
         switch (lvl) {
             case Error: return "ERROR";
@@ -96,8 +94,7 @@ public:
         auto now = std::chrono::system_clock::now();
         time_t now_c = std::chrono::system_clock::to_time_t(now);
 
-        std::tm buf{};
-        if (!localtime_r(&now_c, &buf)) {
+        if (std::tm buf{}; !localtime_r(&now_c, &buf)) {
             ss << "[unknown time] ";
         } else {
             ss << '[' << std::put_time(&buf, "%Y-%m-%d %H:%M:%S") << "] ";
@@ -111,9 +108,6 @@ public:
     }
 };
 
-/**
- * @brief Accessor for singleton Logger instance.
- */
 inline Logger& gLogger() {
     static Logger instance;
     return instance;
@@ -124,10 +118,9 @@ inline Logger& gLogger() {
 namespace concurrent {
 
 /**
- * @brief Single-producer single-consumer lock-free circular queue.
- *        Capacity must be power of two.
- * @tparam T Type to store.
- * @tparam N Buffer Size (power of 2).
+ * @brief Lock-free single-producer single-consumer queue.
+ * @tparam T element type
+ * @tparam N buffer size, must be a power of two.
  */
 template<typename T, size_t N>
 class LockFreeQueue {
@@ -141,8 +134,7 @@ public:
         const size_t tail = tail_.load(std::memory_order_relaxed);
         const size_t nextTail = (tail + 1) & (N - 1);
         if (nextTail == head_.load(std::memory_order_acquire)) {
-            // queue full
-            return false;
+            return false; // full
         }
         buffer_[tail] = item;
         tail_.store(nextTail, std::memory_order_release);
@@ -152,29 +144,21 @@ public:
     std::optional<T> dequeue() noexcept {
         const size_t head = head_.load(std::memory_order_relaxed);
         if (head == tail_.load(std::memory_order_acquire)) {
-            // queue empty
-            return std::nullopt;
+            return std::nullopt; // empty
         }
         T item = buffer_[head];
         head_.store((head + 1) & (N - 1), std::memory_order_release);
         return item;
     }
-
-    bool empty() const noexcept {
-        return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_acquire);
-    }
 };
 
-} // namespace concurrent
+}  // namespace concurrent
 
 namespace gpio {
 
 using SensorId = int;
 enum class SensorType { Door, Motion, Smoke };
 
-/**
- * @brief Sensor event struct.
- */
 struct SensorEvent {
     SensorId sensor;
     SensorType type;
@@ -182,58 +166,39 @@ struct SensorEvent {
     std::chrono::steady_clock::time_point timestamp;
 };
 
-/**
- * @brief GPIOManager manages sensor event queue and debounce filtering.
- */
 class GPIOManager {
     concurrent::LockFreeQueue<SensorEvent, 256> eventQueue_;
     std::unordered_map<SensorId, std::chrono::steady_clock::time_point> lastActivation_;
     static constexpr std::chrono::milliseconds debounceDuration{50};
 
 public:
-    /**
-     * @brief Enqueue a sensor event if it passes debounce.
-     * @param e SensorEvent to enqueue.
-     * @return true if enqueued, false if debounced.
-     */
     bool enqueueEvent(const SensorEvent& e) {
         auto now = std::chrono::steady_clock::now();
         if (auto lastIt = lastActivation_.find(e.sensor);
             lastIt != lastActivation_.end() && (now - lastIt->second < debounceDuration)) {
-            return false; // debounce filter rejected
+            return false;
         }
         lastActivation_[e.sensor] = now;
         return eventQueue_.enqueue(e);
     }
 
-    /**
-     * @brief Dequeue next pending sensor event if available.
-     * @return Optional sensor event.
-     */
     std::optional<SensorEvent> getNextEvent() noexcept {
         return eventQueue_.dequeue();
     }
 };
 
-/**
- * @brief Singleton GPIOManager instance.
- */
 inline GPIOManager& GetGPIOManager() {
     inline GPIOManager instance;
     return instance;
 }
 
-} // namespace gpio
+}  // namespace gpio
 
 namespace persistence {
 
-/**
- * @brief Base exception class for MMapFile errors.
- */
 class MMapFileException : public std::runtime_error {
 public:
-    explicit MMapFileException(const std::string& message)
-        : std::runtime_error(message) {}
+    explicit MMapFileException(const std::string& message) : std::runtime_error(message) {}
 };
 
 class FileOpenException : public MMapFileException {
@@ -254,9 +219,6 @@ public:
         : MMapFileException("Memory mapping failed for file: " + filepath) {}
 };
 
-/**
- * @brief RAII wrapper managing memory-mapped file resource.
- */
 class MMapFile {
     int fd_{-1};
     void* addr_{nullptr};
@@ -264,19 +226,13 @@ class MMapFile {
     std::string filepath_;
 
 public:
-    MMapFile(const char* filename, size_t length)
-        : length_(length)
-        , filepath_(filename) {
+    MMapFile(const char* filename, size_t length) : length_(length), filepath_(filename) {
         fd_ = open(filename, O_RDWR | O_CREAT, 0644);
-        if (fd_ < 0) {
-            throw FileOpenException(filepath_);
-        }
-
+        if (fd_ < 0) throw FileOpenException(filepath_);
         if (ftruncate(fd_, length) < 0) {
             close(fd_);
             throw FileTruncateException(filepath_);
         }
-
         addr_ = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         if (addr_ == MAP_FAILED) {
             close(fd_);
@@ -284,11 +240,9 @@ public:
         }
     }
 
-    // Delete copy ctor and copy assignment (unique resource ownership)
     MMapFile(const MMapFile&) = delete;
     MMapFile& operator=(const MMapFile&) = delete;
 
-    // Move ctor and assignment transfer ownership
     MMapFile(MMapFile&& other) noexcept
         : fd_(other.fd_), addr_(other.addr_), length_(other.length_), filepath_(std::move(other.filepath_)) {
         other.fd_ = -1;
@@ -334,21 +288,14 @@ public:
     size_t size() const noexcept { return length_; }
 };
 
-} // namespace persistence
+}  // namespace persistence
 
 namespace alarm {
 
 using namespace std::chrono_literals;
 
-enum class AlarmState {
-    Disarmed,
-    Armed,
-    Triggered
-};
+enum class AlarmState { Disarmed, Armed, Triggered };
 
-/**
- * @brief Core alarm controller managing armed/disarmed/triggered states.
- */
 class AlarmController {
     mutable std::mutex mutex_;
     AlarmState state_{AlarmState::Disarmed};
@@ -359,7 +306,7 @@ class AlarmController {
 
 public:
     bool arm(std::string_view pin) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lk(mutex_);
         if (pin != adminPin_) return false;
         if (state_ == AlarmState::Disarmed) {
             sensorStatus_.clear();
@@ -371,7 +318,7 @@ public:
     }
 
     bool disarm(std::string_view pin) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lk(mutex_);
         if (pin != adminPin_) return false;
         if (state_ != AlarmState::Disarmed) {
             sensorStatus_.clear();
@@ -383,27 +330,25 @@ public:
     }
 
     AlarmState getState() const {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lk(mutex_);
         return state_;
     }
 
     void processSensorEvent(const gpio::SensorEvent& event) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lk(mutex_);
         if(state_ != AlarmState::Armed) return;
         if(event.activated) {
             sensorStatus_[event.sensor] = true;
             triggeredAt_ = std::chrono::steady_clock::now();
             state_ = AlarmState::Triggered;
             util::gLogger().log(util::LogLevel::Warn,
-                "Alarm triggered by sensor ",
-                event.sensor,
-                " type ",
-                std::to_underlying(event.type));
+                "Alarm triggered by sensor ", event.sensor,
+                " type ", std::to_underlying(event.type));
         }
     }
 
     std::map<gpio::SensorId, bool> getSensorStatus() const {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lk(mutex_);
         return sensorStatus_;
     }
 };
@@ -412,9 +357,6 @@ public:
 
 namespace plugin {
 
-/**
- * @brief Abstract interface for alert plugins.
- */
 class IAlertPlugin {
 public:
     virtual ~IAlertPlugin() = default;
@@ -426,30 +368,11 @@ public:
 using plugin_create_t = IAlertPlugin* (*)();
 using plugin_destroy_t = void (*)(IAlertPlugin*);
 
-/**
- * @brief Helper class to safely cast void* to function pointer using std::variant.
- */
 template <typename FuncPtr>
-class PtrUnion {
-    std::variant<void*, FuncPtr> ptr_;
+FuncPtr safe_cast_function_ptr(void* p) noexcept {
+    return reinterpret_cast<FuncPtr>(p);
+}
 
-public:
-    explicit PtrUnion(void* p) : ptr_(p) {}
-
-    FuncPtr get() {
-        if (std::holds_alternative<FuncPtr>(ptr_)) {
-            return std::get<FuncPtr>(ptr_);
-        }
-        void* objPtr = std::get<void*>(ptr_);
-        auto fptr = reinterpret_cast<FuncPtr>(objPtr);
-        ptr_ = fptr;
-        return fptr;
-    }
-};
-
-/**
- * @brief Dynamic plugin loader and manager.
- */
 class PluginManager {
     void* handle_{nullptr};
     IAlertPlugin* plugin_{nullptr};
@@ -457,7 +380,6 @@ class PluginManager {
 
 public:
     PluginManager() = default;
-
     PluginManager(const PluginManager&) = delete;
     PluginManager& operator=(const PluginManager&) = delete;
 
@@ -469,7 +391,7 @@ public:
     }
 
     PluginManager& operator=(PluginManager&& other) noexcept {
-        if (this != &other) {
+        if(this != &other) {
             unload();
             handle_ = other.handle_;
             plugin_ = other.plugin_;
@@ -482,13 +404,14 @@ public:
     }
 
     bool load(const std::string& path) {
-        if(handle_) return false;
+        if (handle_) return false;
 
         handle_ = dlopen(path.c_str(), RTLD_NOW);
         if (!handle_) {
             util::gLogger().log(util::LogLevel::Error, "Failed to load plugin: ", dlerror());
             return false;
         }
+
         void* createSym = dlsym(handle_, "create_plugin");
         if (!createSym) {
             dlclose(handle_);
@@ -496,8 +419,7 @@ public:
             util::gLogger().log(util::LogLevel::Error, "Plugin: create_plugin symbol missing");
             return false;
         }
-        PtrUnion<plugin_create_t> casterCreate(createSym);
-        auto create = casterCreate.get();
+        auto create = safe_cast_function_ptr<plugin_create_t>(createSym);
 
         void* destroySym = dlsym(handle_, "destroy_plugin");
         if (!destroySym) {
@@ -506,8 +428,7 @@ public:
             util::gLogger().log(util::LogLevel::Error, "Plugin: destroy_plugin symbol missing");
             return false;
         }
-        PtrUnion<plugin_destroy_t> casterDestroy(destroySym);
-        destroy_ = casterDestroy.get();
+        destroy_ = safe_cast_function_ptr<plugin_destroy_t>(destroySym);
 
         plugin_ = create();
         plugin_->initialize();
@@ -537,8 +458,7 @@ public:
         if (plugin_) {
             try {
                 plugin_->alert(message);
-            }
-            catch (...) {
+            } catch(...) {
                 util::gLogger().log(util::LogLevel::Error, "Alert plugin threw exception");
             }
         }
@@ -553,19 +473,16 @@ public:
 
 namespace http {
 
-/**
- * @brief Minimal HTTP server serving a /status endpoint.
- */
 class HttpServer {
     int serverFd_{-1};
     int port_;
-    std::atomic<bool> running_{false};
+    mutable std::atomic<bool> running_{false};
     std::jthread serverThread_;
     std::function<std::string()> statusProvider_;
 
-    void run(std::stop_token stoken) {
+    void run(std::stop_token stoken) const {
         using namespace std::chrono_literals;
-        while (running_ && !stoken.stop_requested()) {
+        while (running_.load(std::memory_order_acquire) && !stoken.stop_requested()) {
             sockaddr_in clientAddr{};
             socklen_t clientLen = sizeof(clientAddr);
             int clientFd = accept(serverFd_, sockaddr_cast(&clientAddr), &clientLen);
@@ -653,9 +570,6 @@ public:
 
 namespace admin {
 
-/**
- * @brief Role-based admin console via stdin.
- */
 class AdminConsole {
     alarm::AlarmController& alarm_;
     plugin::PluginManager& pluginManager_;
@@ -784,7 +698,7 @@ public:
     void stop() {
         running_ = false;
         consoleThread_.request_stop();
-        // jthread joins automatically on destruction
+        // jthread joins on destruction
     }
 
     ~AdminConsole() {
@@ -862,6 +776,7 @@ int main() {
 
     return 0;
 }
+
 
 
 
