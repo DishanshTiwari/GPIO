@@ -1,9 +1,9 @@
 /*
  * @tagline: Real-time GPIO-based Home Alarm System with concurrency, persistence, plugins, and admin console.
  * @intuition: Simulate GPIO sensors with lock-free queue, event-driven polling, debouncing, memory-mapped persistence,
- *            minimal HTTP server, modular alerts, and multi-level logging.
+ *            lightweight HTTP server, modular alerts, and multi-level logging.
  * @approach: Use modern C++23 features: lock-free data structures, memory mapping, dynamic plugin loading,
- *            custom memory pools, and role-based interactive CLI.
+ *            std::jthread with stop tokens, custom memory pools, and role-based interactive CLI.
  * @complexity:
  *   - Time: O(1) per event processing; event loop runs indefinitely.
  *   - Space: Fixed memory pool size with minimal dynamic allocations.
@@ -38,6 +38,12 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <ctime>
+#include <type_traits>
+
+// Utility functions for POSIX sockaddr casting (isolated reinterpret_cast)
+inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
+    return reinterpret_cast<sockaddr*>(addr);
+}
 
 namespace util {
 
@@ -98,6 +104,7 @@ public:
         ss << ToString(lvl) << ": ";
         (ss << ... << std::forward<Args>(args));
         ss << '\n';
+
         std::cout << ss.str();
         std::cout.flush();
     }
@@ -211,7 +218,7 @@ public:
  * @brief Accessor to singleton GPIOManager.
  */
 inline GPIOManager& GetGPIOManager() {
-    static GPIOManager instance;
+    inline GPIOManager instance;
     return instance;
 }
 
@@ -390,7 +397,7 @@ public:
                 "Alarm triggered by sensor ",
                 event.sensor,
                 " type ",
-                static_cast<int>(event.type));
+                std::to_underlying(event.type));
         }
     }
 
@@ -429,7 +436,7 @@ class PluginManager {
 public:
     PluginManager() = default;
 
-    // Delete copy ctor and assignment (unique resource ownership)
+    // Delete copy ctor and assignment (unique ownership)
     PluginManager(const PluginManager&) = delete;
     PluginManager& operator=(const PluginManager&) = delete;
 
@@ -457,25 +464,42 @@ public:
     bool load(const std::string& path) {
         if(handle_) return false;
 
-        handle_ = dlopen(path.c_str(), RTLD_NOW);
-        if (!handle_) {
+        void* sym = dlopen(path.c_str(), RTLD_NOW);
+        if (!sym) {
             util::gLogger().log(util::LogLevel::Error, "Failed to load plugin: ", dlerror());
             return false;
         }
-        auto create = reinterpret_cast<plugin_create_t>(dlsym(handle_, "create_plugin"));
-        if (!create) {
+        handle_ = sym;
+
+        void* createSym = dlsym(handle_, "create_plugin");
+        if (!createSym) {
             dlclose(handle_);
             handle_ = nullptr;
             util::gLogger().log(util::LogLevel::Error, "Plugin: create_plugin symbol missing");
             return false;
         }
-        destroy_ = reinterpret_cast<plugin_destroy_t>(dlsym(handle_, "destroy_plugin"));
-        if (!destroy_) {
+        // Safe conversion from void* to function pointer using union
+        union {
+            void* obj;
+            plugin_create_t func;
+        } casterCreate;
+        casterCreate.obj = createSym;
+        auto create = casterCreate.func;
+
+        void* destroySym = dlsym(handle_, "destroy_plugin");
+        if (!destroySym) {
             dlclose(handle_);
             handle_ = nullptr;
             util::gLogger().log(util::LogLevel::Error, "Plugin: destroy_plugin symbol missing");
             return false;
         }
+        union {
+            void* obj;
+            plugin_destroy_t func;
+        } casterDestroy;
+        casterDestroy.obj = destroySym;
+        destroy_ = casterDestroy.func;
+
         plugin_ = create();
         plugin_->initialize();
         util::gLogger().log(util::LogLevel::Info, "Plugin loaded: ", path);
@@ -527,15 +551,15 @@ class HttpServer {
     int serverFd_{-1};
     int port_;
     std::atomic<bool> running_{false};
-    std::thread serverThread_;
+    std::jthread serverThread_;
     std::function<std::string()> statusProvider_;
 
-    void run() {
+    void run(std::stop_token stoken) {
         using namespace std::chrono_literals;
-        while (running_) {
+        while (running_ && !stoken.stop_requested()) {
             sockaddr_in clientAddr{};
             socklen_t clientLen = sizeof(clientAddr);
-            int clientFd = accept(serverFd_, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+            int clientFd = accept(serverFd_, sockaddr_cast(&clientAddr), &clientLen);
             if (clientFd < 0) {
                 std::this_thread::sleep_for(10ms);
                 continue;
@@ -547,7 +571,7 @@ class HttpServer {
                 continue;
             }
             std::string req{buf.data(), static_cast<size_t>(count)};
-            if (req.find("GET /status") != std::string::npos) {
+            if (req.contains("GET /status")) {
                 std::string body = statusProvider_();
                 std::stringstream response;
                 response << "HTTP/1.1 200 OK\r\n"
@@ -582,7 +606,7 @@ public:
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(port_);
 
-        if (bind(serverFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        if (bind(serverFd_, sockaddr_cast(&addr), sizeof(addr)) < 0) {
             close(serverFd_);
             serverFd_ = -1;
             return false;
@@ -593,7 +617,8 @@ public:
             return false;
         }
         running_ = true;
-        serverThread_ = std::thread(&HttpServer::run, this);
+
+        serverThread_ = std::jthread(&HttpServer::run, this, std::placeholders::_1);
         util::gLogger().log(util::LogLevel::Info, "HTTP server started on port ", port_);
         return true;
     }
@@ -603,12 +628,17 @@ public:
             running_ = false;
             shutdown(serverFd_, SHUT_RDWR);
             close(serverFd_);
-            if (serverThread_.joinable()) serverThread_.join();
+            // Join happens automatically on jthread destruction.
+            if (serverThread_.joinable()) {
+                serverThread_.request_stop();
+                serverThread_.join();
+            }
             util::gLogger().log(util::LogLevel::Info, "HTTP server stopped");
         }
     }
-
-    ~HttpServer() { stop(); }
+    ~HttpServer() {
+        stop();
+    }
 };
 
 }  // namespace http
@@ -622,7 +652,7 @@ class AdminConsole {
     alarm::AlarmController& alarm_;
     plugin::PluginManager& pluginManager_;
     std::atomic<bool> running_{false};
-    std::thread consoleThread_;
+    std::jthread consoleThread_;
 
     static std::vector<std::string> split(std::string_view sv) {
         std::vector<std::string> tokens;
@@ -641,7 +671,6 @@ class AdminConsole {
         return tokens;
     }
 
-    // Refactored command handlers to reduce complexity
     void printHelp() const {
         std::cout << "Commands:\n"
                   << "  arm <pin>          : arm the alarm\n"
@@ -668,10 +697,17 @@ class AdminConsole {
         }
     }
 
-    void printStatus() {
+    void printStatus() const {
         auto state = alarm_.getState();
-        std::string stateStr = (state == alarm::AlarmState::Armed) ? "Armed" :
-                               (state == alarm::AlarmState::Disarmed) ? "Disarmed" : "Triggered";
+        std::string stateStr;
+        if (state == alarm::AlarmState::Armed) {
+            stateStr = "Armed";
+        } else if (state == alarm::AlarmState::Disarmed) {
+            stateStr = "Disarmed";
+        } else {
+            stateStr = "Triggered";
+        }
+
         std::cout << "Alarm state: " << stateStr << "\n";
 
         auto sensors = alarm_.getSensorStatus();
@@ -693,10 +729,10 @@ class AdminConsole {
         std::cout << "Plugin unloaded\n";
     }
 
-    void run() {
+    void run(std::stop_token stoken) {
         util::gLogger().log(util::LogLevel::Info, "Admin Console started. Type 'help'.");
 
-        while (running_) {
+        while (running_ && !stoken.stop_requested()) {
             std::cout << "> " << std::flush;
             std::string line;
             if (!std::getline(std::cin, line)) break;
@@ -719,6 +755,7 @@ class AdminConsole {
                 handleUnloadPlugin();
             } else if (cmd == "quit") {
                 running_ = false;
+                consoleThread_.request_stop();
             } else {
                 std::cout << "Unknown command\n";
             }
@@ -733,15 +770,18 @@ public:
 
     void start() {
         running_ = true;
-        consoleThread_ = std::thread(&AdminConsole::run, this);
+        consoleThread_ = std::jthread(&AdminConsole::run, this);
     }
 
     void stop() {
         running_ = false;
-        if (consoleThread_.joinable()) consoleThread_.join();
+        consoleThread_.request_stop();
+        // No explicit join needed, jthread joins on destruction
     }
 
-    ~AdminConsole() { stop(); }
+    ~AdminConsole() {
+        stop();
+    }
 };
 
 }  // namespace admin
@@ -774,7 +814,7 @@ int main() {
     admin::AdminConsole console(alarmController, pluginManager);
     console.start();
 
-    std::thread gpioThread([]() {
+    std::jthread gpioThread([](std::stop_token stoken) {
         auto& gpioMgr = gpio::GetGPIOManager();
         std::array<gpio::SensorType, 3> types{gpio::SensorType::Door, gpio::SensorType::Motion, gpio::SensorType::Smoke};
         gpio::SensorId sensorId = 1;
@@ -783,7 +823,7 @@ int main() {
         thread_local std::mt19937 rng{std::random_device{}()};
         std::uniform_int_distribution<int> dist(0, 4);
 
-        while (true) {
+        while (!stoken.stop_requested()) {
             bool activate = (dist(rng) == 0);
             if (activate) {
                 gpio::SensorEvent ev{sensorId, types[typeIdx], true, std::chrono::steady_clock::now()};
@@ -807,12 +847,14 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    gpioThread.request_stop();
     gpioThread.join();
     console.stop();
     httpServer.stop();
 
     return 0;
 }
+
 
 
 
