@@ -40,6 +40,7 @@
 #include <unistd.h>
 #include <ctime>
 #include <type_traits>
+#include <cstdint>
 
 // Helper to cast sockaddr_in* to sockaddr* safely (POSIX API requirement)
 inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
@@ -219,7 +220,7 @@ public:
  * @brief Singleton GPIOManager instance.
  */
 inline GPIOManager& GetGPIOManager() {
-    inline GPIOManager instance;
+    static GPIOManager instance;
     return instance;
 }
 
@@ -272,7 +273,7 @@ public:
             throw FileOpenException(filepath_);
         }
 
-        if (ftruncate(fd_, length) < 0) {
+        if (ftruncate(fd_, static_cast<off_t>(length)) < 0) {
             close(fd_);
             throw FileTruncateException(filepath_);
         }
@@ -427,21 +428,22 @@ using plugin_create_t = IAlertPlugin* (*)();
 using plugin_destroy_t = void (*)(IAlertPlugin*);
 
 /**
- * @brief Helper class to safely cast void* to function pointer using std::variant.
+ * @brief Helper class to safely cast function pointers loaded dynamically.
+ * @note Replaces void* with std::uintptr_t to avoid raw pointer in variant.
  */
 template <typename FuncPtr>
 class PtrUnion {
-    std::variant<void*, FuncPtr> ptr_;
+    std::variant<std::uintptr_t, FuncPtr> ptr_;
 
 public:
-    explicit PtrUnion(void* p) : ptr_(p) {}
+    explicit PtrUnion(void* p) : ptr_(reinterpret_cast<std::uintptr_t>(p)) {}
 
     FuncPtr get() {
         if (std::holds_alternative<FuncPtr>(ptr_)) {
             return std::get<FuncPtr>(ptr_);
         }
-        void* objPtr = std::get<void*>(ptr_);
-        auto fptr = reinterpret_cast<FuncPtr>(objPtr);
+        auto intptr = std::get<std::uintptr_t>(ptr_);
+        auto fptr = reinterpret_cast<FuncPtr>(intptr);
         ptr_ = fptr;
         return fptr;
     }
@@ -613,7 +615,7 @@ public:
 
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port_);
+        addr.sin_port = htons(static_cast<uint16_t>(port_));
 
         if (bind(serverFd_, sockaddr_cast(&addr), sizeof(addr)) < 0) {
             close(serverFd_);
@@ -862,3 +864,4 @@ int main() {
 
     return 0;
 }
+
