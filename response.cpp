@@ -28,6 +28,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 #include <array>
 #include <cstring>
@@ -40,7 +41,7 @@
 #include <ctime>
 #include <type_traits>
 
-// Utility functions for POSIX sockaddr casting (isolated reinterpret_cast)
+// Helper to cast sockaddr_in* to sockaddr* safely (POSIX API requirement)
 inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
     return reinterpret_cast<sockaddr*>(addr);
 }
@@ -59,7 +60,7 @@ enum class LogLevel : int {
 };
 
 /**
- * @brief Thread-safe logger with level control and load-based skipping.
+ * @brief Thread-safe logger with log level control and load-based skipping.
  */
 class Logger {
     std::mutex logMutex_;
@@ -193,7 +194,7 @@ public:
     /**
      * @brief Enqueue a sensor event if it passes debounce.
      * @param e SensorEvent to enqueue.
-     * @return true if event enqueued, false if debounced.
+     * @return true if enqueued, false if debounced.
      */
     bool enqueueEvent(const SensorEvent& e) {
         auto now = std::chrono::steady_clock::now();
@@ -215,7 +216,7 @@ public:
 };
 
 /**
- * @brief Accessor to singleton GPIOManager.
+ * @brief Singleton GPIOManager instance.
  */
 inline GPIOManager& GetGPIOManager() {
     inline GPIOManager instance;
@@ -426,6 +427,27 @@ using plugin_create_t = IAlertPlugin* (*)();
 using plugin_destroy_t = void (*)(IAlertPlugin*);
 
 /**
+ * @brief Helper class to safely cast void* to function pointer using std::variant.
+ */
+template <typename FuncPtr>
+class PtrUnion {
+    std::variant<void*, FuncPtr> ptr_;
+
+public:
+    explicit PtrUnion(void* p) : ptr_(p) {}
+
+    FuncPtr get() {
+        if (std::holds_alternative<FuncPtr>(ptr_)) {
+            return std::get<FuncPtr>(ptr_);
+        }
+        void* objPtr = std::get<void*>(ptr_);
+        auto fptr = reinterpret_cast<FuncPtr>(objPtr);
+        ptr_ = fptr;
+        return fptr;
+    }
+};
+
+/**
  * @brief Dynamic plugin loader and manager.
  */
 class PluginManager {
@@ -436,11 +458,9 @@ class PluginManager {
 public:
     PluginManager() = default;
 
-    // Delete copy ctor and assignment (unique ownership)
     PluginManager(const PluginManager&) = delete;
     PluginManager& operator=(const PluginManager&) = delete;
 
-    // Move ctor and assignment transfer ownership
     PluginManager(PluginManager&& other) noexcept
         : handle_(other.handle_), plugin_(other.plugin_), destroy_(other.destroy_) {
         other.handle_ = nullptr;
@@ -464,13 +484,11 @@ public:
     bool load(const std::string& path) {
         if(handle_) return false;
 
-        void* sym = dlopen(path.c_str(), RTLD_NOW);
-        if (!sym) {
+        handle_ = dlopen(path.c_str(), RTLD_NOW);
+        if (!handle_) {
             util::gLogger().log(util::LogLevel::Error, "Failed to load plugin: ", dlerror());
             return false;
         }
-        handle_ = sym;
-
         void* createSym = dlsym(handle_, "create_plugin");
         if (!createSym) {
             dlclose(handle_);
@@ -478,13 +496,8 @@ public:
             util::gLogger().log(util::LogLevel::Error, "Plugin: create_plugin symbol missing");
             return false;
         }
-        // Safe conversion from void* to function pointer using union
-        union {
-            void* obj;
-            plugin_create_t func;
-        } casterCreate;
-        casterCreate.obj = createSym;
-        auto create = casterCreate.func;
+        PtrUnion<plugin_create_t> casterCreate(createSym);
+        auto create = casterCreate.get();
 
         void* destroySym = dlsym(handle_, "destroy_plugin");
         if (!destroySym) {
@@ -493,12 +506,8 @@ public:
             util::gLogger().log(util::LogLevel::Error, "Plugin: destroy_plugin symbol missing");
             return false;
         }
-        union {
-            void* obj;
-            plugin_destroy_t func;
-        } casterDestroy;
-        casterDestroy.obj = destroySym;
-        destroy_ = casterDestroy.func;
+        PtrUnion<plugin_destroy_t> casterDestroy(destroySym);
+        destroy_ = casterDestroy.get();
 
         plugin_ = create();
         plugin_->initialize();
@@ -628,7 +637,6 @@ public:
             running_ = false;
             shutdown(serverFd_, SHUT_RDWR);
             close(serverFd_);
-            // Join happens automatically on jthread destruction.
             if (serverThread_.joinable()) {
                 serverThread_.request_stop();
                 serverThread_.join();
@@ -776,7 +784,7 @@ public:
     void stop() {
         running_ = false;
         consoleThread_.request_stop();
-        // No explicit join needed, jthread joins on destruction
+        // jthread joins automatically on destruction
     }
 
     ~AdminConsole() {
@@ -854,6 +862,7 @@ int main() {
 
     return 0;
 }
+
 
 
 
