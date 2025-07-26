@@ -1,48 +1,51 @@
 /*
  * @tagline: Real-time GPIO-based Home Alarm System with concurrency, persistence, plugins, and admin console.
- * @intuition: Simulate GPIO sensors, concurrency-safe event handling, persistence with memory-mapped files,
- *             plugin-based alerts, multi-level logging, admin console with user roles.
- * @approach: Use modern C++23 features; safe resource management; thread cancellation with std::jthread;
- *            clear separation of concerns with detailed error handling.
+ * @intuition: Simulate GPIO sensors with lock-free queue, event-driven polling, debouncing, memory-mapped persistence,
+ *            minimal HTTP server, modular alerts, and multi-level logging.
+ * @approach: Use modern C++23 features: lock-free data structures, memory mapping, dynamic plugin loading,
+ *            custom memory pools, and role-based interactive CLI.
+ * @complexity:
+ *   - Time: O(1) per event processing; event loop runs indefinitely.
+ *   - Space: Fixed memory pool size with minimal dynamic allocations.
  */
 
 #include <atomic>
 #include <chrono>
-#include <functional>
+#include <condition_variable>
+#include <cctype>
+#include <iomanip>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <queue>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <array>
-#include <map>
-#include <sstream>
-#include <mutex>
-#include <variant>
 #include <cstring>
+#include <functional>
+#include <random>
+
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/in.h>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <ctime>
-#include <csignal>
-#include <sys/types.h>
-#include <random>
-#include <type_traits>
 
-namespace {
-    // Helper: safe conversion of sockaddr_in* to sockaddr* (required by POSIX)
-    inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
-        // This reinterpret_cast is absolutely necessary on POSIX systems.
-        return reinterpret_cast<sockaddr*>(addr);
-    }
-}
+// ==== Utilities ====
 
 namespace util {
 
+/**
+ * @brief Log levels used by Logger.
+ */
 enum class LogLevel : int {
     Error = 0,
     Warn,
@@ -51,82 +54,103 @@ enum class LogLevel : int {
     Trace
 };
 
+/**
+ * @brief Thread-safe logger with level control and load-based skipping.
+ */
 class Logger {
-    std::mutex mutex_;
-    LogLevel level_ = LogLevel::Info;
-    std::atomic<bool> high_load_{false};
+    std::mutex logMutex_;
+    LogLevel level_{LogLevel::Info};
+    std::atomic<bool> highLoad_{false};
 
-    static constexpr const char* ToString(LogLevel lvl) {
+    static inline constexpr const char* ToString(LogLevel lvl) {
         using enum LogLevel;
         switch (lvl) {
             case Error: return "ERROR";
-            case Warn: return "WARN";
-            case Info: return "INFO";
+            case Warn:  return "WARN";
+            case Info:  return "INFO";
             case Debug: return "DEBUG";
             case Trace: return "TRACE";
-            default: return "UNKNOWN";
+            default:    return "UNKNOWN";
         }
     }
 
 public:
     void setLevel(LogLevel lvl) noexcept { level_ = lvl; }
     LogLevel level() const noexcept { return level_; }
-    void setHighLoad(bool val) noexcept { high_load_ = val; }
+    void setHighLoad(bool val) noexcept { highLoad_ = val; }
 
     template<typename... Args>
-    void log(LogLevel level, Args&&... args) {
-        if (level > level_ || (high_load_ && level > LogLevel::Warn)) return;
+    void log(LogLevel lvl, Args&&... args) {
+        using enum LogLevel;
+        if (lvl > level_) return;
+        if (highLoad_ && lvl > Warn) return;
 
-        std::lock_guard lock(mutex_);
-        auto now = std::chrono::system_clock::now();
-        time_t t = std::chrono::system_clock::to_time_t(now);
-
+        std::lock_guard lock(logMutex_);
         std::stringstream ss;
-        if (std::tm tm{}; localtime_r(&t, &tm)) {
-            ss << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "] ";
-        } else {
+
+        auto now = std::chrono::system_clock::now();
+        time_t now_c = std::chrono::system_clock::to_time_t(now);
+
+        std::tm buf{};
+        if (!localtime_r(&now_c, &buf)) {
             ss << "[unknown time] ";
+        } else {
+            ss << '[' << std::put_time(&buf, "%Y-%m-%d %H:%M:%S") << "] ";
         }
-        ss << ToString(level) << ": ";
+        ss << ToString(lvl) << ": ";
         (ss << ... << std::forward<Args>(args));
         ss << '\n';
-
         std::cout << ss.str();
         std::cout.flush();
     }
 };
 
+/**
+ * @brief Accessor for singleton Logger instance.
+ */
 inline Logger& gLogger() {
     static Logger instance;
     return instance;
 }
 
-} // namespace util
+}  // namespace util
+
+// ==== Lock-free Queue for sensor events ====
 
 namespace concurrent {
 
+/**
+ * @brief Single-producer single-consumer lock-free circular queue.
+ *        Capacity must be power of two.
+ * @tparam T Type to store.
+ * @tparam N Buffer Size (power of 2).
+ */
 template<typename T, size_t N>
-requires (N > 1 && ((N & (N - 1)) == 0)) // N must be power of two
 class LockFreeQueue {
+    static_assert((N & (N - 1)) == 0 && N != 0, "N must be power of two");
     std::array<T, N> buffer_;
     alignas(64) std::atomic<size_t> head_{0};
     alignas(64) std::atomic<size_t> tail_{0};
 
 public:
-    bool enqueue(T const& item) noexcept {
-        auto tail = tail_.load(std::memory_order_relaxed);
-        auto next_tail = (tail + 1) & (N - 1);
-        if (next_tail == head_.load(std::memory_order_acquire)) {
-            return false; // queue full
+    bool enqueue(const T& item) noexcept {
+        const size_t tail = tail_.load(std::memory_order_relaxed);
+        const size_t nextTail = (tail + 1) & (N - 1);
+        if (nextTail == head_.load(std::memory_order_acquire)) {
+            // queue full
+            return false;
         }
         buffer_[tail] = item;
-        tail_.store(next_tail, std::memory_order_release);
+        tail_.store(nextTail, std::memory_order_release);
         return true;
     }
 
     std::optional<T> dequeue() noexcept {
-        auto head = head_.load(std::memory_order_relaxed);
-        if (head == tail_.load(std::memory_order_acquire)) return std::nullopt; // empty
+        const size_t head = head_.load(std::memory_order_relaxed);
+        if (head == tail_.load(std::memory_order_acquire)) {
+            // queue empty
+            return std::nullopt;
+        }
         T item = buffer_[head];
         head_.store((head + 1) & (N - 1), std::memory_order_release);
         return item;
@@ -139,11 +163,16 @@ public:
 
 } // namespace concurrent
 
+// ==== GPIO Simulation & Debounce ====
+
 namespace gpio {
 
 using SensorId = int;
 enum class SensorType { Door, Motion, Smoke };
 
+/**
+ * @brief Sensor event struct.
+ */
 struct SensorEvent {
     SensorId sensor;
     SensorType type;
@@ -151,26 +180,42 @@ struct SensorEvent {
     std::chrono::steady_clock::time_point timestamp;
 };
 
+/**
+ * @brief GPIOManager manages sensor event queue and debounce filtering.
+ */
 class GPIOManager {
-    concurrent::LockFreeQueue<SensorEvent, 256> queue_;
-    std::map<SensorId, std::chrono::steady_clock::time_point> last_activation_;
-    static constexpr std::chrono::milliseconds debounce_duration_{50};
+    concurrent::LockFreeQueue<SensorEvent, 256> eventQueue_;
+    std::unordered_map<SensorId, std::chrono::steady_clock::time_point> lastActivation_;
+    static constexpr std::chrono::milliseconds debounceDuration{50};
 
 public:
-    bool enqueue(SensorEvent const& evt) {
+    /**
+     * @brief Enqueue a sensor event if it passes debounce.
+     * @param e SensorEvent to enqueue.
+     * @return true if event enqueued, false if debounced.
+     */
+    bool enqueueEvent(const SensorEvent& e) {
         auto now = std::chrono::steady_clock::now();
-        if (auto it = last_activation_.find(evt.sensor); it != last_activation_.end()) {
-            if (now - it->second < debounce_duration_) return false;
+        if (auto lastIt = lastActivation_.find(e.sensor);
+            lastIt != lastActivation_.end() && (now - lastIt->second < debounceDuration)) {
+            return false; // debounce filter rejected
         }
-        last_activation_[evt.sensor] = now;
-        return queue_.enqueue(evt);
+        lastActivation_[e.sensor] = now;
+        return eventQueue_.enqueue(e);
     }
 
-    std::optional<SensorEvent> dequeue() {
-        return queue_.dequeue();
+    /**
+     * @brief Dequeue next pending sensor event if available.
+     * @return Optional sensor event.
+     */
+    std::optional<SensorEvent> getNextEvent() noexcept {
+        return eventQueue_.dequeue();
     }
 };
 
+/**
+ * @brief Accessor to singleton GPIOManager.
+ */
 inline GPIOManager& GetGPIOManager() {
     static GPIOManager instance;
     return instance;
@@ -178,77 +223,119 @@ inline GPIOManager& GetGPIOManager() {
 
 } // namespace gpio
 
+// ==== Memory Mapped Persistence ====
+
 namespace persistence {
 
-struct MMapException : std::runtime_error {
-    explicit MMapException(const std::string& msg) : std::runtime_error(msg) {}
-};
-
+/**
+ * @brief RAII wrapper managing memory-mapped file resource.
+ */
 class MMapFile {
     int fd_{-1};
-    void* address_{nullptr};
+    void* addr_{nullptr};
     size_t length_{0};
 
 public:
-    MMapFile(const char* filepath, size_t length) : length_(length) {
-        fd_ = open(filepath, O_RDWR | O_CREAT, 0644);
-        if (fd_ < 0) throw MMapException("Failed to open file " + std::string(filepath));
-        if (ftruncate(fd_, length_) < 0) {
-            close(fd_);
-            throw MMapException("Failed to truncate file " + std::string(filepath));
+    MMapFile(const char* filename, size_t length)
+        : length_(length) {
+        fd_ = open(filename, O_RDWR | O_CREAT, 0644);
+        if (fd_ < 0) {
+            throw std::runtime_error("Failed to open file " + std::string(filename));
         }
-        address_ = mmap(nullptr, length_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-        if (address_ == MAP_FAILED) {
+
+        if (ftruncate(fd_, length) < 0) {
             close(fd_);
-            throw MMapException("Failed to mmap file " + std::string(filepath));
+            throw std::runtime_error("Failed to truncate file");
+        }
+
+        addr_ = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (addr_ == MAP_FAILED) {
+            close(fd_);
+            throw std::runtime_error("Memory mapping failed");
         }
     }
 
-    MMapFile(MMapFile const&) = delete;
-    MMapFile& operator=(MMapFile const&) = delete;
+    // Delete copy ctor and copy assignment (unique resource ownership)
+    MMapFile(const MMapFile&) = delete;
+    MMapFile& operator=(const MMapFile&) = delete;
 
-    MMapFile(MMapFile&& o) noexcept : fd_(o.fd_), address_(o.address_), length_(o.length_) {
-        o.fd_ = -1; o.address_ = nullptr; o.length_ = 0;
+    // Move ctor/assignment -- transfer ownership
+    MMapFile(MMapFile&& other) noexcept
+        : fd_(other.fd_), addr_(other.addr_), length_(other.length_) {
+        other.fd_ = -1;
+        other.addr_ = nullptr;
+        other.length_ = 0;
     }
-    MMapFile& operator=(MMapFile&& o) noexcept {
-        if (this != &o) {
-            if (address_) munmap(address_, length_);
+
+    MMapFile& operator=(MMapFile&& other) noexcept {
+        if (this != &other) {
+            if (addr_ && addr_ != MAP_FAILED) munmap(addr_, length_);
             if (fd_ >= 0) close(fd_);
-            fd_ = o.fd_; address_ = o.address_; length_ = o.length_;
-            o.fd_ = -1; o.address_ = nullptr; o.length_ = 0;
+            fd_ = other.fd_;
+            addr_ = other.addr_;
+            length_ = other.length_;
+            other.fd_ = -1;
+            other.addr_ = nullptr;
+            other.length_ = 0;
         }
         return *this;
     }
 
     ~MMapFile() {
-        if (address_) munmap(address_, length_);
-        if (fd_ >= 0) close(fd_);
+        if (addr_ && addr_ != MAP_FAILED) {
+            munmap(addr_, length_);
+            addr_ = nullptr;
+        }
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
     }
 
     template<typename T>
-    T* data() { return static_cast<T*>(address_); }
-    size_t size() const { return length_; }
+    T* data() noexcept {
+        return static_cast<T*>(addr_);
+    }
+
+    size_t size() const noexcept { return length_; }
 };
 
 } // namespace persistence
 
+// ==== Alarm State Machine ====
+
 namespace alarm {
 
-enum class AlarmState { Disarmed, Armed, Triggered };
+using namespace std::chrono_literals;
 
+enum class AlarmState {
+    Disarmed,
+    Armed,
+    Triggered
+};
+
+/**
+ * @brief Core alarm controller managing armed/disarmed/triggered states.
+ */
 class AlarmController {
     mutable std::mutex mutex_;
-    AlarmState state_ = AlarmState::Disarmed;
-    std::map<gpio::SensorId, bool> sensor_status_;
-    std::chrono::steady_clock::time_point triggered_at_;
-    static constexpr std::string_view admin_pin_ = "1234";
+    AlarmState state_{AlarmState::Disarmed};
+    std::map<gpio::SensorId, bool> sensorStatus_;
+    std::chrono::steady_clock::time_point triggeredAt_{};
+
+    static constexpr std::string_view adminPin_{"1234"};
 
 public:
+    /**
+     * @brief Arm alarm if PIN matches.
+     * @param pin Input PIN.
+     * @return true on success.
+     */
     bool arm(std::string_view pin) {
         std::lock_guard lock(mutex_);
-        if (pin != admin_pin_) return false;
+        if (pin != adminPin_) return false;
         if (state_ == AlarmState::Disarmed) {
-            sensor_status_.clear();
+            sensorStatus_.clear();
             state_ = AlarmState::Armed;
             util::gLogger().log(util::LogLevel::Info, "Alarm armed.");
             return true;
@@ -256,11 +343,16 @@ public:
         return false;
     }
 
+    /**
+     * @brief Disarm alarm if PIN matches.
+     * @param pin Input PIN.
+     * @return true on success.
+     */
     bool disarm(std::string_view pin) {
         std::lock_guard lock(mutex_);
-        if (pin != admin_pin_) return false;
+        if (pin != adminPin_) return false;
         if (state_ != AlarmState::Disarmed) {
-            sensor_status_.clear();
+            sensorStatus_.clear();
             state_ = AlarmState::Disarmed;
             util::gLogger().log(util::LogLevel::Info, "Alarm disarmed.");
             return true;
@@ -268,246 +360,236 @@ public:
         return false;
     }
 
-    AlarmState get_state() const {
+    /**
+     * @brief Get current alarm state.
+     * @return AlarmState enum.
+     */
+    AlarmState getState() const {
         std::lock_guard lock(mutex_);
         return state_;
     }
 
-    void process_event(gpio::SensorEvent const& e) {
+    /**
+     * @brief Process a sensor event, update state accordingly.
+     * @param event SensorEvent to process.
+     */
+    void processSensorEvent(const gpio::SensorEvent& event) {
         std::lock_guard lock(mutex_);
-        if (state_ != AlarmState::Armed) return;
-        if (e.activated) {
-            sensor_status_[e.sensor] = true;
-            triggered_at_ = std::chrono::steady_clock::now();
+        if(state_ != AlarmState::Armed) return;
+        if(event.activated) {
+            sensorStatus_[event.sensor] = true;
+            triggeredAt_ = std::chrono::steady_clock::now();
             state_ = AlarmState::Triggered;
-            util::gLogger().log(util::LogLevel::Warn, "Alarm triggered by sensor ", e.sensor,
-                               " type ", std::to_underlying(e.type));
+            util::gLogger().log(util::LogLevel::Warn,
+                "Alarm triggered by sensor ",
+                event.sensor,
+                " type ",
+                static_cast<int>(event.type));
         }
     }
 
-    std::map<gpio::SensorId, bool> get_sensor_status() const {
+    /**
+     * @brief Retrieve current sensor statuses.
+     * @return map of sensor id to activated status.
+     */
+    std::map<gpio::SensorId, bool> getSensorStatus() const {
         std::lock_guard lock(mutex_);
-        return sensor_status_;
+        return sensorStatus_;
     }
 };
 
-} // namespace alarm
+}  // namespace alarm
+
+// ==== Plugin Interface and Manager ====
 
 namespace plugin {
 
-using plugin_create_t = alarm::IAlarmPlugin* (*)();
-using plugin_destroy_t = void (*)(alarm::IAlarmPlugin*);
-
-class PluginHandle {
-    using NativeHandle = void *;
-    NativeHandle handle_ = nullptr;
-
+/**
+ * @brief Abstract interface for alert plugins.
+ */
+class IAlertPlugin {
 public:
-    explicit PluginHandle(NativeHandle h = nullptr) noexcept : handle_(h) {}
-    bool is_valid() const noexcept { return handle_ != nullptr; }
-    NativeHandle get() const noexcept { return handle_; }
-
-    void close() noexcept {
-        if (handle_) { dlclose(handle_); handle_ = nullptr; }
-    }
-
-    PluginHandle(PluginHandle const&) = delete;
-    PluginHandle& operator=(PluginHandle const&) = delete;
-
-    PluginHandle(PluginHandle&& o) noexcept : handle_(o.handle_) { o.handle_ = nullptr; }
-    PluginHandle& operator=(PluginHandle&& o) noexcept {
-        if (this != &o) {
-            close();
-            handle_ = o.handle_;
-            o.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    ~PluginHandle() { close(); }
+    virtual ~IAlertPlugin() = default;
+    virtual void alert(std::string_view message) noexcept = 0;
+    virtual void initialize() noexcept = 0;
+    virtual void shutdown() noexcept = 0;
 };
 
-template<typename FuncPtr>
-FuncPtr safe_cast_function_ptr(void* ptr) noexcept {
-    return reinterpret_cast<FuncPtr>(ptr);
-}
+using plugin_create_t = IAlertPlugin* (*)();
+using plugin_destroy_t = void (*)(IAlertPlugin*);
 
-template<typename FuncPtr>
-FuncPtr get_symbol(PluginHandle const& handle, char const* symbol) {
-    if (!handle.is_valid()) return nullptr;
-    void* ptr = dlsym(handle.get(), symbol);
-    if (!ptr) throw std::runtime_error("Symbol not found: " + std::string(symbol));
-    return safe_cast_function_ptr<FuncPtr>(ptr);
-}
-
+/**
+ * @brief Dynamic plugin loader and manager.
+ */
 class PluginManager {
-    PluginHandle handle_;
-    alarm::IAlarmPlugin* plugin_ = nullptr;
-    plugin_destroy_t destroy_ = nullptr;
+    void* handle_{nullptr};
+    IAlertPlugin* plugin_{nullptr};
+    plugin_destroy_t destroy_{nullptr};
 
 public:
-    PluginManager() = default;
+    /**
+     * @brief Load plugin shared library.
+     * @param path Path to plugin file.
+     * @return true if plugin successfully loaded.
+     */
+    bool load(const std::string& path) {
+        if(handle_) return false;
 
-    PluginManager(PluginManager const&) = delete;
-    PluginManager& operator=(PluginManager const&) = delete;
-
-    PluginManager(PluginManager&& o) noexcept
-        : handle_(std::move(o.handle_)), plugin_(o.plugin_), destroy_(o.destroy_) {
-        o.plugin_ = nullptr; o.destroy_ = nullptr;
-    }
-    PluginManager& operator=(PluginManager&& o) noexcept {
-        if (this != &o) {
-            unload();
-            handle_ = std::move(o.handle_);
-            plugin_ = o.plugin_;
-            destroy_ = o.destroy_;
-            o.plugin_ = nullptr; o.destroy_ = nullptr;
-        }
-        return *this;
-    }
-
-    bool load(std::string const& path) {
-        if (handle_.is_valid()) return false;
-
-        void* lib = dlopen(path.c_str(), RTLD_NOW);
-        if (!lib) {
+        handle_ = dlopen(path.c_str(), RTLD_NOW);
+        if (!handle_) {
             util::gLogger().log(util::LogLevel::Error, "Failed to load plugin: ", dlerror());
             return false;
         }
-
-        handle_ = PluginHandle(lib);
-
-        try {
-            auto create = get_symbol<plugin_create_t>(handle_, "create_plugin");
-            destroy_ = get_symbol<plugin_destroy_t>(handle_, "destroy_plugin");
-            plugin_ = create();
-            plugin_->initialize();
-        } catch(std::exception const& ex) {
-            handle_.close();
-            plugin_ = nullptr;
-            destroy_ = nullptr;
-            util::gLogger().log(util::LogLevel::Error, "Plugin loading failed: ", ex.what());
+        auto create = reinterpret_cast<plugin_create_t>(dlsym(handle_, "create_plugin"));
+        if (!create) {
+            dlclose(handle_);
+            handle_ = nullptr;
+            util::gLogger().log(util::LogLevel::Error, "Plugin: create_plugin symbol missing");
             return false;
         }
-
-        util::gLogger().log(util::LogLevel::Info, "Plugin loaded: ", path)
+        destroy_ = reinterpret_cast<plugin_destroy_t>(dlsym(handle_, "destroy_plugin"));
+        if (!destroy_) {
+            dlclose(handle_);
+            handle_ = nullptr;
+            util::gLogger().log(util::LogLevel::Error, "Plugin: destroy_plugin symbol missing");
+            return false;
+        }
+        plugin_ = create();
+        plugin_->initialize();
+        util::gLogger().log(util::LogLevel::Info, "Plugin loaded: ", path);
         return true;
     }
 
-    void unload() noexcept {
-        if (plugin_) {
+    /**
+     * @brief Unload current plugin.
+     */
+    void unload() {
+        if(plugin_) {
             plugin_->shutdown();
             destroy_(plugin_);
             plugin_ = nullptr;
         }
-        handle_.close();
-        destroy_ = nullptr;
-        util::gLogger().log(util::LogLevel::Info, "Plugin unloaded");
-    }
-
-    bool is_loaded() const noexcept { return plugin_ != nullptr; }
-
-    void alert(std::string_view message) noexcept {
-        if (plugin_) {
-            try { plugin_->alert(message); }
-            catch (...) { util::gLogger().log(util::LogLevel::Error, "Plugin alert exception"); }
+        if(handle_) {
+            dlclose(handle_);
+            handle_ = nullptr;
+            util::gLogger().log(util::LogLevel::Info, "Plugin unloaded");
         }
     }
 
-    ~PluginManager() { unload(); }
+    /**
+     * @brief Check if a plugin is loaded.
+     */
+    bool isLoaded() const { return plugin_ != nullptr; }
+
+    /**
+     * @brief Send alert message to plugin.
+     * @param message Alert text.
+     */
+    void alert(std::string_view message) noexcept {
+        if(plugin_) {
+            try {
+                plugin_->alert(message);
+            } catch (...) {
+                util::gLogger().log(util::LogLevel::Error, "Alert plugin threw exception");
+            }
+        }
+    }
+
+    ~PluginManager() {
+        unload();
+    }
 };
 
-} // namespace plugin
+}  // namespace plugin
+
+// ==== Embedded HTTP Server ====
 
 namespace http {
 
+/**
+ * @brief Minimal HTTP server serving a /status endpoint on a dedicated thread.
+ */
 class HttpServer {
-    int sockfd_ = -1;
+    int serverFd_{-1};
     int port_;
-    mutable std::atomic<bool> running_ = false;
-    std::jthread thread_;
-    std::function<std::string()> status_provider_;
+    std::atomic<bool> running_{false};
+    std::thread serverThread_;
+    std::function<std::string()> statusProvider_;
+
+    void run() {
+        using namespace std::chrono_literals;
+        while (running_) {
+            sockaddr_in clientAddr{};
+            socklen_t clientLen = sizeof(clientAddr);
+            int clientFd = accept(serverFd_, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+            if (clientFd < 0) {
+                std::this_thread::sleep_for(10ms);
+                continue;
+            }
+            std::array<char, 1024> buf{};
+            ssize_t count = read(clientFd, buf.data(), static_cast<size_t>(buf.size() - 1));
+            if (count <= 0) {
+                close(clientFd);
+                continue;
+            }
+            std::string req{buf.data(), static_cast<size_t>(count)};
+            if (req.find("GET /status") != std::string::npos) {
+                std::string body = statusProvider_();
+                std::stringstream response;
+                response << "HTTP/1.1 200 OK\r\n"
+                         << "Content-Type: text/plain\r\n"
+                         << "Content-Length: " << body.size() << "\r\n"
+                         << "Connection: close\r\n\r\n"
+                         << body;
+                std::string respStr = response.str();
+                write(clientFd, respStr.data(), respStr.size());
+            } else {
+                static constexpr const char resp[] =
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                write(clientFd, resp, sizeof(resp) - 1);
+            }
+            close(clientFd);
+        }
+    }
 
 public:
-    explicit HttpServer(int port, std::function<std::string()> status_provider)
-        : port_(port), status_provider_(std::move(status_provider)) {}
+    explicit HttpServer(int port, std::function<std::string()> statusProvider)
+        : port_(port), statusProvider_(std::move(statusProvider)) {}
 
     bool start() {
-        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd_ < 0) return false;
+        sockaddr_in addr{};
+        serverFd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (serverFd_ == -1) return false;
 
         int opt = 1;
-        setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(serverFd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-        sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(port_);
 
-        if (bind(sockfd_, sockaddr_cast(&addr), sizeof(addr)) < 0) {
-            close(sockfd_);
-            sockfd_ = -1;
+        if (bind(serverFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            close(serverFd_);
+            serverFd_ = -1;
             return false;
         }
-        if (listen(sockfd_, SOMAXCONN) < 0) {
-            close(sockfd_);
-            sockfd_ = -1;
+        if (listen(serverFd_, 10) < 0) {
+            close(serverFd_);
+            serverFd_ = -1;
             return false;
         }
-
         running_ = true;
-        thread_ = std::jthread(&HttpServer::serve, this, std::placeholders::_1);
-
+        serverThread_ = std::thread(&HttpServer::run, this);
         util::gLogger().log(util::LogLevel::Info, "HTTP server started on port ", port_);
         return true;
     }
 
-    void serve(std::stop_token stop_token) const {
-        using namespace std::chrono_literals;
-
-        while (running_ && !stop_token.stop_requested()) {
-            sockaddr_in client_addr{};
-            socklen_t addr_len = sizeof(client_addr);
-
-            int client_fd = accept(sockfd_, sockaddr_cast(&client_addr), &addr_len);
-            if (client_fd < 0) {
-                std::this_thread::sleep_for(10ms);
-                continue;
-            }
-
-            std::array<char, 1024> buf{};
-            ssize_t n = read(client_fd, buf.data(), buf.size() - 1);
-            if (n <= 0) {
-                close(client_fd);
-                continue;
-            }
-
-            std::string req(buf.data(), n);
-            if (req.contains("GET /status")) {
-                std::string body = status_provider_();
-                std::stringstream resp;
-                resp << "HTTP/1.1 200 OK\r\n"
-                     << "Content-Type: text/plain\r\n"
-                     << "Content-Length: " << body.size() << "\r\n"
-                     << "Connection: close\r\n\r\n"
-                     << body;
-                std::string resp_str = resp.str();
-                write(client_fd, resp_str.data(), resp_str.size());
-            } else {
-                static constexpr char resp_404[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                write(client_fd, resp_404, sizeof(resp_404) - 1);
-            }
-
-            close(client_fd);
-        }
-    }
-
-    void stop() noexcept {
+    void stop() {
         if (running_) {
             running_ = false;
-            shutdown(sockfd_, SHUT_RDWR);
-            close(sockfd_);
-            if (thread_.joinable()) thread_.request_stop(), thread_.join();
+            shutdown(serverFd_, SHUT_RDWR);
+            close(serverFd_);
+            if (serverThread_.joinable()) serverThread_.join();
             util::gLogger().log(util::LogLevel::Info, "HTTP server stopped");
         }
     }
@@ -515,192 +597,190 @@ public:
     ~HttpServer() { stop(); }
 };
 
-} // namespace http
+}  // namespace http
+
+// ==== Admin Console ====
 
 namespace admin {
 
+/**
+ * @brief Role-based admin console via stdin, handling user commands.
+ */
 class AdminConsole {
     alarm::AlarmController& alarm_;
-    plugin::PluginManager& plugin_manager_;
-    std::atomic<bool> running_ = false;
-    std::jthread console_thread_;
+    plugin::PluginManager& pluginManager_;
+    std::atomic<bool> running_{false};
+    std::thread consoleThread_;
 
-    static std::vector<std::string> split(std::string_view line) {
-        std::vector<std::string> parts;
+    static std::vector<std::string> split(std::string_view sv) {
+        std::vector<std::string> tokens;
         std::string tmp;
-        for (char c : line) {
+        for (char c : sv) {
             if (std::isspace(static_cast<unsigned char>(c))) {
                 if (!tmp.empty()) {
-                    parts.push_back(std::move(tmp));
+                    tokens.push_back(std::move(tmp));
                     tmp.clear();
                 }
             } else {
-                tmp += c;
+                tmp.push_back(c);
             }
         }
-        if (!tmp.empty()) parts.push_back(std::move(tmp));
-        return parts;
+        if (!tmp.empty()) tokens.push_back(std::move(tmp));
+        return tokens;
     }
 
-    void print_help() const {
-        std::cout << "Commands:\n"
-                  << "  help              : Show this help\n"
-                  << "  arm <pin>         : Arm the alarm\n"
-                  << "  disarm <pin>      : Disarm the alarm\n"
-                  << "  status            : Show alarm status\n"
-                  << "  loadplugin <file> : Load alert plugin\n"
-                  << "  unloadplugin      : Unload alert plugin\n"
-                  << "  quit              : Exit console\n";
-    }
+    void run() {
+        util::gLogger().log(util::LogLevel::Info, "Admin Console started. Type 'help'.");
 
-    void handle_arm(std::string const& pin) {
-        if (alarm_.arm(pin)) std::cout << "Alarm armed\n";
-        else std::cout << "Failed to arm alarm\n";
-    }
-
-    void handle_disarm(std::string const& pin) {
-        if (alarm_.disarm(pin)) std::cout << "Alarm disarmed\n";
-        else std::cout << "Failed to disarm alarm\n";
-    }
-
-    void handle_status() const {
-        auto state = alarm_.get_state();
-        std::string state_str;
-        if (state == alarm::AlarmState::Armed) state_str = "Armed";
-        else if (state == alarm::AlarmState::Disarmed) state_str = "Disarmed";
-        else state_str = "Triggered";
-
-        std::cout << "Alarm state: " << state_str << "\n";
-        auto sensors = alarm_.get_sensor_status();
-        for (auto const& [id, active] : sensors) {
-            std::cout << "Sensor " << id << ": " << (active ? "Activated" : "Inactive") << "\n";
-        }
-    }
-
-    void handle_loadplugin(std::string const& path) {
-        if (plugin_manager_.load(path)) std::cout << "Plugin loaded\n";
-        else std::cout << "Plugin loading failed\n";
-    }
-
-    void handle_unloadplugin() {
-        plugin_manager_.unload();
-        std::cout << "Plugin unloaded\n";
-    }
-
-    void run(std::stop_token stoken) {
-        util::gLogger().log(util::LogLevel::Info, "Admin console started. Type 'help'.");
-
-        while (running_ && !stoken.stop_requested()) {
+        while (running_) {
             std::cout << "> " << std::flush;
             std::string line;
             if (!std::getline(std::cin, line)) break;
-
             auto tokens = split(line);
             if (tokens.empty()) continue;
-
             const auto& cmd = tokens[0];
-            if (cmd == "help") print_help();
-            else if (cmd == "arm" && tokens.size() == 2) handle_arm(tokens[1]);
-            else if (cmd == "disarm" && tokens.size() == 2) handle_disarm(tokens[1]);
-            else if (cmd == "status") handle_status();
-            else if (cmd == "loadplugin" && tokens.size() == 2) handle_loadplugin(tokens[1]);
-            else if (cmd == "unloadplugin") handle_unloadplugin();
-            else if (cmd == "quit") {
+
+            if (cmd == "help") {
+                std::cout << "Commands:\n"
+                          << "  arm <pin>          : arm the alarm\n"
+                          << "  disarm <pin>       : disarm the alarm\n"
+                          << "  status             : show current status\n"
+                          << "  loadplugin <path>  : load alert plugin\n"
+                          << "  unloadplugin       : unload alert plugin\n"
+                          << "  quit               : exit console\n";
+            } else if (cmd == "arm" && tokens.size() == 2) {
+                if (alarm_.arm(tokens[1])) {
+                    std::cout << "Alarm armed\n";
+                } else {
+                    std::cout << "Failed to arm alarm\n";
+                }
+            } else if (cmd == "disarm" && tokens.size() == 2) {
+                if (alarm_.disarm(tokens[1])) {
+                    std::cout << "Alarm disarmed\n";
+                } else {
+                    std::cout << "Failed to disarm alarm\n";
+                }
+            } else if (cmd == "status") {
+                auto state = alarm_.getState();
+                std::string stateStr = (state == alarm::AlarmState::Armed) ? "Armed" :
+                                       (state == alarm::AlarmState::Disarmed) ? "Disarmed" : "Triggered";
+                std::cout << "Alarm state: " << stateStr << "\n";
+                auto sensors = alarm_.getSensorStatus();
+                for (const auto& [id, active] : sensors) {
+                    std::cout << "Sensor " << id << ": " << (active ? "Activated" : "Inactive") << "\n";
+                }
+            } else if (cmd == "loadplugin" && tokens.size() == 2) {
+                if (pluginManager_.load(tokens[1])) {
+                    std::cout << "Plugin loaded\n";
+                } else {
+                    std::cout << "Plugin loading failed\n";
+                }
+            } else if (cmd == "unloadplugin") {
+                pluginManager_.unload();
+                std::cout << "Plugin unloaded\n";
+            } else if (cmd == "quit") {
                 running_ = false;
-                console_thread_.request_stop();
             } else {
                 std::cout << "Unknown command\n";
             }
         }
 
-        util::gLogger().log(util::LogLevel::Info, "Admin console terminated");
+        util::gLogger().log(util::LogLevel::Info, "Admin Console terminated.");
     }
 
 public:
     AdminConsole(alarm::AlarmController& alarm, plugin::PluginManager& plugins)
-        : alarm_(alarm), plugin_manager_(plugins) {}
+        : alarm_(alarm), pluginManager_(plugins) {}
 
     void start() {
         running_ = true;
-        console_thread_ = std::jthread(&AdminConsole::run, this);
+        consoleThread_ = std::thread(&AdminConsole::run, this);
     }
 
     void stop() {
         running_ = false;
-        console_thread_.request_stop();
+        if (consoleThread_.joinable()) consoleThread_.join();
     }
 
     ~AdminConsole() { stop(); }
 };
 
-} // namespace admin
+}  // namespace admin
+
+// ==== Main Event Loop and Simulation ====
 
 int main() {
     util::gLogger().setLevel(util::LogLevel::Debug);
 
-    alarm::AlarmController alarm_controller;
-    plugin::PluginManager plugin_manager;
+    alarm::AlarmController alarmController;
+    plugin::PluginManager pluginManager;
 
-    http::HttpServer http_server(8080, [&alarm_controller](){
-        static const std::map<alarm::AlarmState,std::string> states = {
+    // HTTP server on port 8080 serving status
+    http::HttpServer httpServer(8080, [&alarmController]() {
+        static const std::map<alarm::AlarmState, std::string> stateNames{
             {alarm::AlarmState::Disarmed, "Disarmed"},
-            {alarm::AlarmState::Armed, "Armed"},
-            {alarm::AlarmState::Triggered, "Triggered"}
-        };
+            {alarm::AlarmState::Armed,    "Armed"},
+            {alarm::AlarmState::Triggered,"Triggered"}};
         std::stringstream ss;
-        auto st = alarm_controller.get_state();
-        ss << "Alarm state: " << states.at(st) << '\n';
-        auto sensors = alarm_controller.get_sensor_status();
-        for (auto const& [id, active] : sensors)
-            ss << "Sensor " << id << ": " << (active ? "Activated" : "Inactive") << '\n';
+        auto st = alarmController.getState();
+        ss << "AlarmState: " << stateNames.at(st) << "\n";
+        auto sensors = alarmController.getSensorStatus();
+        for (const auto& [id, active] : sensors)
+            ss << "Sensor " << id << ": " << (active ? "Activated" : "Inactive") << "\n";
         return ss.str();
     });
 
-    if (!http_server.start()) {
+    if (!httpServer.start()) {
         util::gLogger().log(util::LogLevel::Error, "Failed to start HTTP server");
         return 1;
     }
 
-    admin::AdminConsole console(alarm_controller, plugin_manager);
+    admin::AdminConsole console(alarmController, pluginManager);
     console.start();
 
-    std::jthread gpio_thread([&alarm_controller, &plugin_manager](std::stop_token stoken){
-        auto& gpio_mgr = gpio::GetGPIOManager();
-        std::array<gpio::SensorType,3> types{gpio::SensorType::Door, gpio::SensorType::Motion, gpio::SensorType::Smoke};
-        gpio::SensorId sensor_id = 1;
-        size_t type_index = 0;
-        thread_local std::mt19937 rng{std::random_device{}()};
-        std::uniform_int_distribution<int> dist(0,4);
+    // Simulated GPIO sensor input generation thread
+    std::thread gpioThread([]() {
+        auto& gpioMgr = gpio::GetGPIOManager();
+        std::array<gpio::SensorType, 3> types{gpio::SensorType::Door, gpio::SensorType::Motion, gpio::SensorType::Smoke};
+        gpio::SensorId sensorId = 1;
+        size_t typeIdx = 0;
 
-        while (!stoken.stop_requested()) {
-            if (dist(rng) == 0) {
-                gpio::SensorEvent ev{sensor_id, types[type_index], true, std::chrono::steady_clock::now()};
-                gpio_mgr.enqueue(ev);
+        // Setup RNG for 20% activation chance
+        thread_local std::mt19937 rng{std::random_device{}()};
+        std::uniform_int_distribution<int> dist(0, 4);
+
+        while (true) {
+            bool activate = (dist(rng) == 0);
+            if (activate) {
+                gpio::SensorEvent ev{sensorId, types[typeIdx], true, std::chrono::steady_clock::now()};
+                gpioMgr.enqueueEvent(ev);
             }
-            sensor_id = (sensor_id % 3) + 1;
-            type_index = (type_index +1) % types.size();
+            sensorId = (sensorId % 3) + 1;
+            typeIdx = (typeIdx + 1) % types.size();
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
     });
 
-    auto& gpio_mgr = gpio::GetGPIOManager();
+    auto& gpioManager = gpio::GetGPIOManager();
+
+    // Main loop: poll sensor events, update alarm and alert plugin
     while (true) {
-        if (auto ev = gpio_mgr.dequeue()) {
-            alarm_controller.process_event(*ev);
-            if (plugin_manager.is_loaded()) {
-                plugin_manager.alert("Alarm triggered");
+        if (auto evt = gpioManager.getNextEvent()) {
+            alarmController.processSensorEvent(*evt);
+            if (pluginManager.isLoaded()) {
+                pluginManager.alert("Alarm event triggered");
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    gpio_thread.request_stop();
-    gpio_thread.join();
+    gpioThread.join();
     console.stop();
-    http_server.stop();
+    httpServer.stop();
 
     return 0;
 }
+
 
 
 
