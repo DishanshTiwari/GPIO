@@ -368,15 +368,57 @@ public:
 using plugin_create_t = IAlertPlugin* (*)();
 using plugin_destroy_t = void (*)(IAlertPlugin*);
 
+class PluginHandle {
+    void* handle_{nullptr};
+public:
+    explicit PluginHandle(void* handle = nullptr) noexcept : handle_(handle) {}
+    bool isValid() const noexcept { return handle_ != nullptr; }
+    void* get() const noexcept { return handle_; }
+
+    void close() {
+        if (handle_) {
+            dlclose(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    PluginHandle(const PluginHandle&) = delete;
+    PluginHandle& operator=(const PluginHandle&) = delete;
+
+    PluginHandle(PluginHandle&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    PluginHandle& operator=(PluginHandle&& other) noexcept {
+        if (this != &other) {
+            close();
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~PluginHandle() {
+        close();
+    }
+};
+
 template <typename FuncPtr>
 FuncPtr safe_cast_function_ptr(void* p) noexcept {
     return reinterpret_cast<FuncPtr>(p);
 }
 
+template <typename FuncPtr>
+FuncPtr get_symbol(const PluginHandle& ph, const char* symbolName) {
+    void* sym = dlsym(ph.get(), symbolName);
+    if (!sym) throw std::runtime_error("Symbol not found: " + std::string(symbolName));
+    return safe_cast_function_ptr<FuncPtr>(sym);
+}
+
 class PluginManager {
-    void* handle_{nullptr};
-    IAlertPlugin* plugin_{nullptr};
-    plugin_destroy_t destroy_{nullptr};
+    PluginHandle handle_;
+    IAlertPlugin* plugin_ = nullptr;
+    plugin_destroy_t destroy_ = nullptr;
 
 public:
     PluginManager() = default;
@@ -384,19 +426,17 @@ public:
     PluginManager& operator=(const PluginManager&) = delete;
 
     PluginManager(PluginManager&& other) noexcept
-        : handle_(other.handle_), plugin_(other.plugin_), destroy_(other.destroy_) {
-        other.handle_ = nullptr;
+        : handle_(std::move(other.handle_)), plugin_(other.plugin_), destroy_(other.destroy_) {
         other.plugin_ = nullptr;
         other.destroy_ = nullptr;
     }
 
     PluginManager& operator=(PluginManager&& other) noexcept {
-        if(this != &other) {
+        if (this != &other) {
             unload();
-            handle_ = other.handle_;
+            handle_ = std::move(other.handle_);
             plugin_ = other.plugin_;
             destroy_ = other.destroy_;
-            other.handle_ = nullptr;
             other.plugin_ = nullptr;
             other.destroy_ = nullptr;
         }
@@ -404,35 +444,29 @@ public:
     }
 
     bool load(const std::string& path) {
-        if (handle_) return false;
+        if (handle_.isValid()) return false;
 
-        handle_ = dlopen(path.c_str(), RTLD_NOW);
-        if (!handle_) {
+        void* libHandle = dlopen(path.c_str(), RTLD_NOW);
+        if (!libHandle) {
             util::gLogger().log(util::LogLevel::Error, "Failed to load plugin: ", dlerror());
             return false;
         }
+        handle_ = PluginHandle(libHandle);
 
-        void* createSym = dlsym(handle_, "create_plugin");
-        if (!createSym) {
-            dlclose(handle_);
-            handle_ = nullptr;
-            util::gLogger().log(util::LogLevel::Error, "Plugin: create_plugin symbol missing");
+        try {
+            auto create = get_symbol<plugin_create_t>(handle_, "create_plugin");
+            destroy_ = get_symbol<plugin_destroy_t>(handle_, "destroy_plugin");
+
+            plugin_ = create();
+            plugin_->initialize();
+            util::gLogger().log(util::LogLevel::Info, "Plugin loaded: ", path);
+        } catch (const std::exception& e) {
+            handle_.close();
+            plugin_ = nullptr;
+            destroy_ = nullptr;
+            util::gLogger().log(util::LogLevel::Error, "Plugin load error: ", e.what());
             return false;
         }
-        auto create = safe_cast_function_ptr<plugin_create_t>(createSym);
-
-        void* destroySym = dlsym(handle_, "destroy_plugin");
-        if (!destroySym) {
-            dlclose(handle_);
-            handle_ = nullptr;
-            util::gLogger().log(util::LogLevel::Error, "Plugin: destroy_plugin symbol missing");
-            return false;
-        }
-        destroy_ = safe_cast_function_ptr<plugin_destroy_t>(destroySym);
-
-        plugin_ = create();
-        plugin_->initialize();
-        util::gLogger().log(util::LogLevel::Info, "Plugin loaded: ", path);
         return true;
     }
 
@@ -442,12 +476,9 @@ public:
             destroy_(plugin_);
             plugin_ = nullptr;
         }
-        if (handle_) {
-            dlclose(handle_);
-            handle_ = nullptr;
-            util::gLogger().log(util::LogLevel::Info, "Plugin unloaded");
-        }
+        handle_.close();
         destroy_ = nullptr;
+        util::gLogger().log(util::LogLevel::Info, "Plugin unloaded");
     }
 
     bool isLoaded() const noexcept {
@@ -458,7 +489,7 @@ public:
         if (plugin_) {
             try {
                 plugin_->alert(message);
-            } catch(...) {
+            } catch (...) {
                 util::gLogger().log(util::LogLevel::Error, "Alert plugin threw exception");
             }
         }
@@ -698,7 +729,7 @@ public:
     void stop() {
         running_ = false;
         consoleThread_.request_stop();
-        // jthread joins on destruction
+        // jthread join on destruction automatically
     }
 
     ~AdminConsole() {
@@ -776,6 +807,7 @@ int main() {
 
     return 0;
 }
+
 
 
 
